@@ -78,6 +78,31 @@ function buildEntries(wallets, total) {
   return entries.filter((e) => e.amt > 0n);
 }
 
+function roundPayout(info) {
+  const raw = info.payoutAmount ?? info[3];
+  return raw == null ? 0n : BigInt(raw);
+}
+
+async function readRoundInfo(publicClient, distributor, roundId) {
+  return publicClient.readContract({
+    address: distributor,
+    abi: distributorAbi,
+    functionName: "roundInfo",
+    args: [roundId],
+  });
+}
+
+async function waitForRoundFunding(publicClient, distributor, roundId) {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const info = await readRoundInfo(publicClient, distributor, roundId);
+    const payoutAmount = roundPayout(info);
+    if (payoutAmount > 0n) return { info, payoutAmount };
+    if (attempt < 5) await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  const info = await readRoundInfo(publicClient, distributor, roundId);
+  return { info, payoutAmount: roundPayout(info) };
+}
+
 async function payAll(wallet, publicClient, roundId, merkle) {
   for (let i = 0; i < merkle.leaves.length; i += BATCH) {
     const slice = merkle.leaves.slice(i, i + BATCH);
@@ -130,7 +155,9 @@ async function routeFees(wallet, publicClient, router, paired, projectToken) {
       console.log("routeToken", token, hash, receipt.status);
     } catch (e) {
       const msg = String(e?.shortMessage || e?.message || e);
-      if (!msg.includes("NothingToRoute")) console.log("routeToken skipped", token, msg);
+      if (!msg.includes("NothingToRoute") && !msg.includes("reverted")) {
+        console.log("routeToken skipped", token, msg);
+      }
     }
   }
 }
@@ -281,22 +308,21 @@ export async function run() {
     console.log("resume open round", openedRoundId.toString());
   }
 
-  const absorbHash = await wallet.writeContract({
-    address: distributor,
-    abi: distributorAbi,
-    functionName: "absorbBalance",
-    args: [openedRoundId],
-  });
-  await publicClient.waitForTransactionReceipt({ hash: absorbHash });
-  console.log("absorbBalance", absorbHash);
+  let { info, payoutAmount } = await waitForRoundFunding(publicClient, distributor, openedRoundId);
+  if (payoutAmount === 0n) {
+    const absorbHash = await wallet.writeContract({
+      address: distributor,
+      abi: distributorAbi,
+      functionName: "absorbBalance",
+      args: [openedRoundId],
+    });
+    await publicClient.waitForTransactionReceipt({ hash: absorbHash });
+    console.log("absorbBalance", absorbHash);
+    ({ info, payoutAmount } = await waitForRoundFunding(publicClient, distributor, openedRoundId));
+  } else {
+    console.log("round already funded", payoutAmount.toString());
+  }
 
-  const info = await publicClient.readContract({
-    address: distributor,
-    abi: distributorAbi,
-    functionName: "roundInfo",
-    args: [openedRoundId],
-  });
-  const payoutAmount = info[3];
   if (payoutAmount === 0n) {
     console.log("no token fees to distribute this run");
     return;
