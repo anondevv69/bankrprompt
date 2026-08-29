@@ -9,6 +9,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { base } from "viem/chains";
 import { buildMerkle, equalSplit } from "./merkle.js";
 import { fetchRenewers } from "./dune.js";
+import { claimDopplerIfAvailable } from "./doppler.js";
 
 const BATCH = Number(process.env.PAY_BATCH_SIZE || "40");
 const WETH = "0x4200000000000000000000000000000000000006";
@@ -133,6 +134,17 @@ export async function run() {
   const claimTokens = [WETH, paired, projectToken].filter(Boolean);
   for (const claimToken of claimTokens) {
     await claimIfAvailable(publicClient, wallet, feeLocker, router, claimToken);
+  }
+
+  if (projectToken && !dryRun()) {
+    try {
+      await claimDopplerIfAvailable(publicClient, wallet, router, projectToken);
+    } catch (e) {
+      const msg = String(e?.shortMessage || e?.message || e);
+      console.log("doppler claim skipped:", msg);
+    }
+  } else if (projectToken && dryRun()) {
+    console.log("dryRun doppler claim for", projectToken);
   }
 
   try {
