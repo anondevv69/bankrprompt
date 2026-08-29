@@ -230,6 +230,8 @@ export async function run() {
   console.log("done round", openedRoundId.toString());
 }
 
+console.log("bankrprompt-keeper starting", new Date().toISOString());
+
 run().catch((err) => {
   console.error(err);
   process.exit(1);
