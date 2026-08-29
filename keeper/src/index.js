@@ -112,7 +112,6 @@ function roundPayout(info) {
 function rpcUrls() {
   const custom = String(process.env.BASE_RPC_URL || "").trim();
   const fallbacks = [
-    "https://1rpc.io/base",
     "https://base.drpc.org",
     "https://base-mainnet.public.blastapi.io",
     "https://mainnet.base.org",
