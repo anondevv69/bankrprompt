@@ -26,7 +26,9 @@ const feeLockerAbi = parseAbi([
 const routerAbi = parseAbi([
   "function route() returns (uint256 opsAmount, uint256 tokenAmount)",
   "function routeToken(address token) returns (uint256 amount)",
+  "function PROJECT_TOKEN() view returns (address)",
 ]);
+const erc20Abi = parseAbi(["function balanceOf(address account) view returns (uint256)"]);
 const distributorAbi = parseAbi([
   "function roundCount() view returns (uint256)",
   "function openRound(address token) returns (uint256 roundId)",
@@ -189,6 +191,29 @@ async function payAll(wallet, publicClient, roundId, merkle, startIndex = 0) {
   }
 }
 
+async function tokenBalance(publicClient, token, holder) {
+  return publicClient.readContract({
+    address: getAddress(token),
+    abi: erc20Abi,
+    functionName: "balanceOf",
+    args: [getAddress(holder)],
+  });
+}
+
+async function routeTokenIfHeld(wallet, publicClient, router, token) {
+  const bal = await tokenBalance(publicClient, token, router);
+  if (bal === 0n) return 0n;
+  const hash = await wallet.writeContract({
+    address: router,
+    abi: routerAbi,
+    functionName: "routeToken",
+    args: [getAddress(token)],
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  console.log("routeToken", token, hash, receipt.status, "amount", bal.toString());
+  return bal;
+}
+
 async function routeFees(wallet, publicClient, router, paired, projectToken) {
   if (dryRun()) {
     console.log("dryRun route()");
@@ -211,21 +236,36 @@ async function routeFees(wallet, publicClient, router, paired, projectToken) {
     if (!msg.includes("NothingToRoute")) console.log("route skipped:", msg);
   }
 
+  // route() only forwards the router's immutable PROJECT_TOKEN; always routeToken env tokens too.
   const routeTokens = [...new Set([paired, projectToken].filter(Boolean))];
   for (const token of routeTokens) {
     try {
-      const hash = await wallet.writeContract({
-        address: router,
-        abi: routerAbi,
-        functionName: "routeToken",
-        args: [token],
-      });
-      const receipt = await publicClient.waitForTransactionReceipt({ hash });
-      console.log("routeToken", token, hash, receipt.status);
+      await routeTokenIfHeld(wallet, publicClient, router, token);
     } catch (e) {
       const msg = String(e?.shortMessage || e?.message || e);
-      if (!msg.includes("NothingToRoute") && !msg.includes("reverted")) {
-        console.log("routeToken skipped", token, msg);
+      if (msg.includes("NothingToRoute")) continue;
+      console.log("routeToken failed", token, msg);
+      throw e;
+    }
+  }
+
+  if (projectToken) {
+    const routerProject = await publicClient.readContract({
+      address: router,
+      abi: routerAbi,
+      functionName: "PROJECT_TOKEN",
+    });
+    if (getAddress(routerProject) !== getAddress(projectToken)) {
+      const stuck = await tokenBalance(publicClient, projectToken, router);
+      if (stuck > 0n) {
+        console.log(
+          "router PROJECT_TOKEN mismatch:",
+          routerProject,
+          "env",
+          projectToken,
+          "still on router",
+          stuck.toString(),
+        );
       }
     }
   }
@@ -419,14 +459,30 @@ export async function run() {
   if (!resumingLocked) {
     ({ payoutAmount } = await waitForRoundFunding(publicClient, distributor, roundId));
     if (payoutAmount === 0n) {
-      const absorbHash = await wallet.writeContract({
-        address: distributor,
-        abi: distributorAbi,
-        functionName: "absorbBalance",
-        args: [roundId],
-      });
-      await publicClient.waitForTransactionReceipt({ hash: absorbHash });
-      console.log("absorbBalance", absorbHash);
+      const distributorBal = await tokenBalance(publicClient, projectToken, distributor);
+      const routerBal = await tokenBalance(publicClient, projectToken, router);
+      if (distributorBal === 0n && routerBal > 0n) {
+        console.log("routing project token to distributor before absorb", routerBal.toString());
+        await routeTokenIfHeld(wallet, publicClient, router, projectToken);
+      }
+
+      try {
+        const absorbHash = await wallet.writeContract({
+          address: distributor,
+          abi: distributorAbi,
+          functionName: "absorbBalance",
+          args: [roundId],
+        });
+        await publicClient.waitForTransactionReceipt({ hash: absorbHash });
+        console.log("absorbBalance", absorbHash);
+      } catch (e) {
+        const msg = String(e?.shortMessage || e?.message || e);
+        const distBal = await tokenBalance(publicClient, projectToken, distributor);
+        const rtrBal = await tokenBalance(publicClient, projectToken, router);
+        console.log("absorbBalance failed", msg, { distributorBal: distBal.toString(), routerBal: rtrBal.toString() });
+        throw e;
+      }
+
       ({ payoutAmount } = await waitForRoundFunding(publicClient, distributor, roundId, {
         poll: true,
       }));
