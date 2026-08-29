@@ -1,0 +1,11 @@
+{
+  "name": "bankrprompt",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "postinstall": "npm install --prefix keeper",
+    "start": "npm start --prefix keeper"
+  }
+}
