@@ -27,11 +27,12 @@ Distributor v1 is fine — keep `0x2a3D…`.
 
 ## Railway (quick start)
 
-1. Push this repo to GitHub (see below if empty).
-2. [New Railway project](https://railway.app) → Deploy from GitHub → `anondevv69/bankrprompt`
-3. **Root Directory:** `keeper`
-4. Add variables from `keeper/.env.example`
-5. Deploy — cron runs hourly (`keeper/railway.toml`)
+1. [New Railway project](https://railway.app) → Deploy from GitHub → `anondevv69/bankrprompt`
+2. **Root Directory:** leave as `/` (repo root — `package.json` bootstraps `keeper/`)
+3. Add variables from `keeper/.env.example`
+4. Deploy — cron runs hourly (`railway.toml` at repo root)
+
+**Alternative:** set Root Directory to `keeper` and use `keeper/railway.toml` instead.
 
 **Test without a launched token:** set `KEEPER_KEY`, router/distributor addresses, `DUNE_API_KEY`. Leave `PROJECT_TOKEN` empty — keeper will claim/route only and skip renewer payouts.
 
