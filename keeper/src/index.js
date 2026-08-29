@@ -2,6 +2,7 @@ import {
   createPublicClient,
   createWalletClient,
   decodeEventLog,
+  fallback,
   getAddress,
   http,
   parseAbi,
@@ -83,24 +84,69 @@ function roundPayout(info) {
   return raw == null ? 0n : BigInt(raw);
 }
 
-async function readRoundInfo(publicClient, distributor, roundId) {
-  return publicClient.readContract({
-    address: distributor,
-    abi: distributorAbi,
-    functionName: "roundInfo",
-    args: [roundId],
-  });
+function rpcUrls() {
+  return [
+    process.env.BASE_RPC_URL,
+    "https://base.llamarpc.com",
+    "https://1rpc.io/base",
+    "https://mainnet.base.org",
+  ].filter(Boolean);
 }
 
-async function waitForRoundFunding(publicClient, distributor, roundId) {
-  for (let attempt = 0; attempt < 6; attempt++) {
-    const info = await readRoundInfo(publicClient, distributor, roundId);
-    const payoutAmount = roundPayout(info);
-    if (payoutAmount > 0n) return { info, payoutAmount };
-    if (attempt < 5) await new Promise((resolve) => setTimeout(resolve, 2000));
+function makeTransport() {
+  const urls = [...new Set(rpcUrls())];
+  if (urls.length === 1) return http(urls[0]);
+  return fallback(urls.map((url) => http(url)));
+}
+
+function isRateLimitError(err) {
+  const msg = String(err?.shortMessage || err?.message || err?.details || err);
+  return msg.includes("rate limit") || msg.includes("-32016");
+}
+
+async function withRpcRetry(fn, attempts = 5) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isRateLimitError(err) || i === attempts - 1) throw err;
+      const delayMs = 1500 * (i + 1);
+      console.log(`rpc rate limited, retry ${i + 1}/${attempts - 1} in ${delayMs}ms`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
   }
-  const info = await readRoundInfo(publicClient, distributor, roundId);
-  return { info, payoutAmount: roundPayout(info) };
+  throw lastErr;
+}
+
+async function readRoundInfo(publicClient, distributor, roundId) {
+  return withRpcRetry(() =>
+    publicClient.readContract({
+      address: distributor,
+      abi: distributorAbi,
+      functionName: "roundInfo",
+      args: [roundId],
+    }),
+  );
+}
+
+async function waitForRoundFunding(publicClient, distributor, roundId, { poll = false } = {}) {
+  let result = await readRoundInfo(publicClient, distributor, roundId).then((info) => ({
+    info,
+    payoutAmount: roundPayout(info),
+  }));
+  if (result.payoutAmount > 0n || !poll) return result;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    result = await readRoundInfo(publicClient, distributor, roundId).then((info) => ({
+      info,
+      payoutAmount: roundPayout(info),
+    }));
+    if (result.payoutAmount > 0n) return result;
+  }
+  return result;
 }
 
 async function payAll(wallet, publicClient, roundId, merkle) {
@@ -223,10 +269,10 @@ async function claimIfAvailable(publicClient, wallet, feeLocker, router, claimTo
 }
 
 export async function run() {
-  const rpc = process.env.BASE_RPC_URL || "https://mainnet.base.org";
+  const transport = makeTransport();
   const account = privateKeyToAccount(key());
-  const publicClient = createPublicClient({ chain: base, transport: http(rpc) });
-  const wallet = createWalletClient({ account, chain: base, transport: http(rpc) });
+  const publicClient = createPublicClient({ chain: base, transport });
+  const wallet = createWalletClient({ account, chain: base, transport });
 
   const paired = envMaybe("PAIRED_TOKEN", DEFAULT_BNKR);
   const projectToken = envMaybe("PROJECT_TOKEN");
@@ -308,7 +354,7 @@ export async function run() {
     console.log("resume open round", openedRoundId.toString());
   }
 
-  let { info, payoutAmount } = await waitForRoundFunding(publicClient, distributor, openedRoundId);
+  let { payoutAmount } = await waitForRoundFunding(publicClient, distributor, openedRoundId);
   if (payoutAmount === 0n) {
     const absorbHash = await wallet.writeContract({
       address: distributor,
@@ -318,7 +364,9 @@ export async function run() {
     });
     await publicClient.waitForTransactionReceipt({ hash: absorbHash });
     console.log("absorbBalance", absorbHash);
-    ({ info, payoutAmount } = await waitForRoundFunding(publicClient, distributor, openedRoundId));
+    ({ payoutAmount } = await waitForRoundFunding(publicClient, distributor, openedRoundId, {
+      poll: true,
+    }));
   } else {
     console.log("round already funded", payoutAmount.toString());
   }
