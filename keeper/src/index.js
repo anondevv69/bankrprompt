@@ -11,9 +11,17 @@ import { buildMerkle, equalSplit } from "./merkle.js";
 import { fetchRenewers } from "./dune.js";
 
 const BATCH = Number(process.env.PAY_BATCH_SIZE || "40");
+const WETH = "0x4200000000000000000000000000000000000006";
+const CLANKER_FEE_LOCKER =
+  process.env.CLANKER_FEE_LOCKER || "0xF3622742b1E446D92e45E22923Ef11C2fcD55D68";
 
+const feeLockerAbi = parseAbi([
+  "function claim(address feeOwner, address token) external",
+  "function availableFees(address feeOwner, address token) view returns (uint256)",
+]);
 const routerAbi = parseAbi([
   "function route() returns (uint256 wethAmount, uint256 tokenAmount)",
+  "function routeToken(address token) returns (uint256 amount)",
 ]);
 const distributorAbi = parseAbi([
   "function roundCount() view returns (uint256)",
@@ -79,6 +87,25 @@ export async function run() {
   console.log("keeper", account.address);
   console.log("epoch", process.env.EPOCH_MODE || "august_backfill");
 
+  const feeLocker = getAddress(CLANKER_FEE_LOCKER.toLowerCase());
+  for (const claimToken of [WETH, token]) {
+    const available = await publicClient.readContract({
+      address: feeLocker,
+      abi: feeLockerAbi,
+      functionName: "availableFees",
+      args: [router, claimToken],
+    });
+    if (available === 0n) continue;
+    const claimHash = await wallet.writeContract({
+      address: feeLocker,
+      abi: feeLockerAbi,
+      functionName: "claim",
+      args: [router, claimToken],
+    });
+    await publicClient.waitForTransactionReceipt({ hash: claimHash });
+    console.log("feeLocker.claim", claimToken, claimHash, available.toString());
+  }
+
   try {
     const hash = await wallet.writeContract({
       address: router,
@@ -90,6 +117,20 @@ export async function run() {
   } catch (e) {
     const msg = String(e?.shortMessage || e?.message || e);
     if (!msg.includes("NothingToRoute")) console.log("route skipped:", msg);
+  }
+
+  try {
+    const hash = await wallet.writeContract({
+      address: router,
+      abi: routerAbi,
+      functionName: "routeToken",
+      args: [token],
+    });
+    await publicClient.waitForTransactionReceipt({ hash });
+    console.log("routeToken", token, hash);
+  } catch (e) {
+    const msg = String(e?.shortMessage || e?.message || e);
+    if (!msg.includes("NothingToRoute")) console.log("routeToken skipped:", msg);
   }
 
   const { wallets, window } = await fetchRenewers({
