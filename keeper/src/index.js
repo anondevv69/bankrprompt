@@ -95,6 +95,27 @@ function sortWallets(wallets) {
   return wallets.map((w) => getAddress(w.toLowerCase())).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
+function merkleForWallets(walletList, payoutAmount) {
+  return buildMerkle(buildEntries(walletList, payoutAmount));
+}
+
+function matchLockedMerkle(rawWallets, payoutAmount, lockedRoot) {
+  const candidates = [
+    { label: "sorted", wallets: sortWallets(rawWallets) },
+    { label: "dune", wallets: rawWallets.map((w) => getAddress(w.toLowerCase())) },
+  ];
+  for (const { label, wallets } of candidates) {
+    const merkle = merkleForWallets(wallets, payoutAmount);
+    if (merkle.root === lockedRoot) {
+      console.log("merkle order", label);
+      return { wallets, merkle };
+    }
+  }
+  throw new Error(
+    `cannot match locked merkle root ${lockedRoot} (tried sorted + dune wallet order)`,
+  );
+}
+
 async function waitForRoundLocked(publicClient, distributor, roundId) {
   for (let attempt = 0; attempt < 8; attempt++) {
     const info = await readRoundInfo(publicClient, distributor, roundId);
@@ -422,7 +443,6 @@ export async function run() {
 
   const active = await findActiveRound(publicClient, distributor, projectToken);
   const resumingLocked = active?.phase === PHASE_LOCKED;
-  const wallets = resumingLocked ? rawWallets.map((w) => getAddress(w.toLowerCase())) : sortWallets(rawWallets);
 
   let roundId;
   let payoutAmount;
