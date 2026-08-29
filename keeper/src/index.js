@@ -53,6 +53,16 @@ function key() {
   return raw.startsWith("0x") ? raw : `0x${raw}`;
 }
 
+function dryRun() {
+  return process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true";
+}
+
+function testWallets() {
+  const raw = String(process.env.TEST_WALLETS || "").trim();
+  if (!raw) return null;
+  return raw.split(/[,\s]+/).filter(Boolean).map((w) => getAddress(w.toLowerCase()));
+}
+
 function buildEntries(wallets, total) {
   const n = BigInt(wallets.length);
   const { each, remainder } = equalSplit(BigInt(total), n);
@@ -88,6 +98,10 @@ async function claimIfAvailable(publicClient, wallet, feeLocker, router, claimTo
     args: [router, claimToken],
   });
   if (available === 0n) return;
+  if (dryRun()) {
+    console.log("dryRun feeLocker.claim", claimToken, available.toString());
+    return;
+  }
   const claimHash = await wallet.writeContract({
     address: feeLocker,
     abi: feeLockerAbi,
@@ -110,6 +124,7 @@ export async function run() {
   const distributor = envAddr("BANKR_RENEWER_DISTRIBUTOR");
 
   console.log("keeper", account.address);
+  console.log("dryRun", dryRun());
   console.log("epoch", process.env.EPOCH_MODE || "august_backfill");
   console.log("paired", paired || "(none)");
   console.log("project", projectToken || "(none — claim/route only)");
@@ -121,13 +136,17 @@ export async function run() {
   }
 
   try {
-    const hash = await wallet.writeContract({
-      address: router,
-      abi: routerAbi,
-      functionName: "route",
-    });
-    const receipt = await publicClient.waitForTransactionReceipt({ hash });
-    console.log("route", hash, receipt.status);
+    if (dryRun()) {
+      console.log("dryRun route()");
+    } else {
+      const hash = await wallet.writeContract({
+        address: router,
+        abi: routerAbi,
+        functionName: "route",
+      });
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      console.log("route", hash, receipt.status);
+    }
   } catch (e) {
     const msg = String(e?.shortMessage || e?.message || e);
     if (!msg.includes("NothingToRoute")) console.log("route skipped:", msg);
@@ -138,18 +157,24 @@ export async function run() {
     return;
   }
 
-  const { wallets, window } = await fetchRenewers({
+  const { wallets: duneWallets, window } = await fetchRenewers({
     apiKey: env("DUNE_API_KEY"),
     epochMode: process.env.EPOCH_MODE || "august_backfill",
     epochStart: process.env.EPOCH_START || "2026-08-01",
-    epochEnd: process.env.EPOCH_END || "2026-08-31",
+    epochEnd: process.env.EPOCH_END || "2026-08-28",
   });
 
+  const wallets = testWallets() ?? duneWallets;
   if (wallets.length === 0) {
     console.log("no renewers in window", window);
     return;
   }
-  console.log("renewers", wallets.length, window);
+  console.log("renewers", wallets.length, window, testWallets() ? "(TEST_WALLETS override)" : "");
+
+  if (dryRun()) {
+    console.log("dryRun would openRound, absorb, lock, payBatch for", wallets.length, "wallets");
+    return;
+  }
 
   const openHash = await wallet.writeContract({
     address: distributor,

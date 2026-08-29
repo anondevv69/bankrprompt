@@ -49,9 +49,12 @@ export async function fetchRenewers({ apiKey, epochMode, epochStart, epochEnd })
     end = w.end;
   }
 
+  const includeNew = process.env.INCLUDE_NEW_SIGNUPS === "1" || process.env.INCLUDE_NEW_SIGNUPS === "true";
+
   const members = new Set();
   for (const row of rows) {
-    if (!row.is_renewal) continue;
+    const eligible = row.is_renewal || (includeNew && row.is_new);
+    if (!eligible) continue;
     const ms = parseTime(row.block_time);
     if (!inRange(ms, start, end)) continue;
     const m = String(row.member || "").toLowerCase();
