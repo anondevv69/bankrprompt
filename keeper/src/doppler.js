@@ -44,18 +44,6 @@ export async function claimDopplerIfAvailable(publicClient, wallet, router, proj
   const { poolId, initializer } = await fetchDopplerMeta(projectToken);
   console.log("doppler claim", { poolId, initializer, claimable: status.claimableFees });
 
-  const collectAbi = [
-    {
-      name: "collectFees",
-      type: "function",
-      stateMutability: "nonpayable",
-      inputs: [{ name: "poolId", type: "bytes32" }],
-      outputs: [
-        { name: "amount0", type: "uint256" },
-        { name: "amount1", type: "uint256" },
-      ],
-    },
-  ];
   const claimDopplerAbi = [
     {
       name: "claimDoppler",
@@ -72,26 +60,12 @@ export async function claimDopplerIfAvailable(publicClient, wallet, router, proj
     },
   ];
 
-  try {
-    const hash = await wallet.writeContract({
-      address: router,
-      abi: claimDopplerAbi,
-      functionName: "claimDoppler",
-      args: [initializer, poolId],
-    });
-    const receipt = await publicClient.waitForTransactionReceipt({ hash });
-    console.log("claimDoppler", hash, receipt.status);
-    return;
-  } catch (e) {
-    console.log("claimDoppler on router failed, trying initializer:", String(e?.shortMessage || e?.message || e));
-  }
-
   const hash = await wallet.writeContract({
-    address: initializer,
-    abi: collectAbi,
-    functionName: "collectFees",
-    args: [poolId],
+    address: router,
+    abi: claimDopplerAbi,
+    functionName: "claimDoppler",
+    args: [initializer, poolId],
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  console.log("collectFees", hash, receipt.status);
+  console.log("claimDoppler", hash, receipt.status);
 }
