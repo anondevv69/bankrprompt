@@ -6,6 +6,10 @@ interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
 }
 
+interface IDopplerFees {
+    function collectFees(bytes32 poolId) external returns (uint256 amount0, uint256 amount1);
+}
+
 /// @title BankrFeeRouter
 /// @notice Routes claimed Bankr/Clanker fees on Base.
 /// Paired asset (BNKR or WETH) → ops wallet. Project token → renewer distributor.
@@ -77,5 +81,14 @@ contract BankrFeeRouter {
         if (!IERC20(token).transfer(to, amount)) revert TransferFailed();
         if (_opsToken(token)) emit OpsRouted(token, to, amount);
         else emit TokenRouted(token, to, amount);
+    }
+
+    /// @notice Claim Doppler/Bankr pool fees when this contract is fee beneficiary.
+    function claimDoppler(address initializer, bytes32 poolId)
+        external
+        returns (uint256 amount0, uint256 amount1)
+    {
+        if (initializer == address(0)) revert ZeroAddress();
+        return IDopplerFees(initializer).collectFees(poolId);
     }
 }
