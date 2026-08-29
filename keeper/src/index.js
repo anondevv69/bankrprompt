@@ -110,12 +110,17 @@ function roundPayout(info) {
 }
 
 function rpcUrls() {
-  return [
-    process.env.BASE_RPC_URL,
+  const custom = String(process.env.BASE_RPC_URL || "").trim();
+  const fallbacks = [
     "https://base.llamarpc.com",
     "https://1rpc.io/base",
     "https://mainnet.base.org",
-  ].filter(Boolean);
+  ];
+  // Dedicated provider (Alchemy, etc.) first; skip bare mainnet.base.org as primary.
+  if (custom && !fallbacks.includes(custom)) {
+    return [custom, ...fallbacks];
+  }
+  return fallbacks;
 }
 
 function makeTransport() {
@@ -192,12 +197,14 @@ async function payAll(wallet, publicClient, roundId, merkle, startIndex = 0) {
 }
 
 async function tokenBalance(publicClient, token, holder) {
-  return publicClient.readContract({
-    address: getAddress(token),
-    abi: erc20Abi,
-    functionName: "balanceOf",
-    args: [getAddress(holder)],
-  });
+  return withRpcRetry(() =>
+    publicClient.readContract({
+      address: getAddress(token),
+      abi: erc20Abi,
+      functionName: "balanceOf",
+      args: [getAddress(holder)],
+    }),
+  );
 }
 
 function isNothingToRoute(err) {
