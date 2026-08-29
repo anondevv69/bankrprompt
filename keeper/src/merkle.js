@@ -4,8 +4,16 @@ export function leafHash(who, amt) {
   return keccak256(encodePacked(["address", "uint256"], [who, amt]));
 }
 
+function bytes32Cmp(a, b) {
+  const ai = BigInt(a);
+  const bi = BigInt(b);
+  if (ai < bi) return -1;
+  if (ai > bi) return 1;
+  return 0;
+}
+
 export function hashPair(a, b) {
-  return a.toLowerCase() <= b.toLowerCase()
+  return bytes32Cmp(a, b) <= 0
     ? keccak256(encodePacked(["bytes32", "bytes32"], [a, b]))
     : keccak256(encodePacked(["bytes32", "bytes32"], [b, a]));
 }
