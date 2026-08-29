@@ -200,26 +200,34 @@ async function tokenBalance(publicClient, token, holder) {
   });
 }
 
+function isNothingToRoute(err) {
+  const msg = String(err?.shortMessage || err?.message || err?.cause?.signature || err);
+  return msg.includes("NothingToRoute") || msg.includes("0x37f4322d");
+}
+
 async function routeTokenIfHeld(wallet, publicClient, router, token) {
   const bal = await tokenBalance(publicClient, token, router);
   if (bal === 0n) return 0n;
-  const hash = await wallet.writeContract({
-    address: router,
-    abi: routerAbi,
-    functionName: "routeToken",
-    args: [getAddress(token)],
-  });
-  const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  console.log("routeToken", token, hash, receipt.status, "amount", bal.toString());
-  return bal;
+  try {
+    const hash = await wallet.writeContract({
+      address: router,
+      abi: routerAbi,
+      functionName: "routeToken",
+      args: [getAddress(token)],
+    });
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    console.log("routeToken", token, hash, receipt.status, "amount", bal.toString());
+    return bal;
+  } catch (e) {
+    if (isNothingToRoute(e)) return 0n;
+    throw e;
+  }
 }
 
 async function routeFees(wallet, publicClient, router, paired, projectToken) {
   if (dryRun()) {
     console.log("dryRun route()");
-    for (const token of [...new Set([paired, projectToken].filter(Boolean))]) {
-      console.log("dryRun routeToken", token);
-    }
+    if (projectToken) console.log("dryRun routeToken", projectToken);
     return;
   }
 
@@ -233,42 +241,32 @@ async function routeFees(wallet, publicClient, router, paired, projectToken) {
     console.log("route", hash, receipt.status);
   } catch (e) {
     const msg = String(e?.shortMessage || e?.message || e);
-    if (!msg.includes("NothingToRoute")) console.log("route skipped:", msg);
+    if (!isNothingToRoute(e)) console.log("route skipped:", msg);
   }
 
-  // route() only forwards the router's immutable PROJECT_TOKEN; always routeToken env tokens too.
-  const routeTokens = [...new Set([paired, projectToken].filter(Boolean))];
-  for (const token of routeTokens) {
-    try {
-      await routeTokenIfHeld(wallet, publicClient, router, token);
-    } catch (e) {
-      const msg = String(e?.shortMessage || e?.message || e);
-      if (msg.includes("NothingToRoute")) continue;
-      console.log("routeToken failed", token, msg);
-      throw e;
-    }
-  }
+  // route() already forwards WETH + PAIRED_TOKEN + the router's immutable PROJECT_TOKEN.
+  // Only routeToken when env PROJECT_TOKEN differs (e.g. t4 vs TEST baked into router).
+  if (!projectToken) return;
 
-  if (projectToken) {
-    const routerProject = await publicClient.readContract({
-      address: router,
-      abi: routerAbi,
-      functionName: "PROJECT_TOKEN",
-    });
-    if (getAddress(routerProject) !== getAddress(projectToken)) {
-      const stuck = await tokenBalance(publicClient, projectToken, router);
-      if (stuck > 0n) {
-        console.log(
-          "router PROJECT_TOKEN mismatch:",
-          routerProject,
-          "env",
-          projectToken,
-          "still on router",
-          stuck.toString(),
-        );
-      }
-    }
-  }
+  const routerProject = await publicClient.readContract({
+    address: router,
+    abi: routerAbi,
+    functionName: "PROJECT_TOKEN",
+  });
+  if (getAddress(routerProject) === getAddress(projectToken)) return;
+
+  const stuck = await tokenBalance(publicClient, projectToken, router);
+  if (stuck === 0n) return;
+
+  console.log(
+    "router PROJECT_TOKEN mismatch:",
+    routerProject,
+    "env",
+    projectToken,
+    "routing",
+    stuck.toString(),
+  );
+  await routeTokenIfHeld(wallet, publicClient, router, projectToken);
 }
 
 async function findActiveRound(publicClient, distributor, projectToken) {
