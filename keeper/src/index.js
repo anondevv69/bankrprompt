@@ -38,6 +38,7 @@ const distributorAbi = parseAbi([
 ]);
 
 const PHASE_OPEN = 0;
+const PHASE_LOCKED = 1;
 
 function env(name, fallback = "") {
   const v = String(process.env[name] || fallback).trim();
@@ -79,8 +80,30 @@ function buildEntries(wallets, total) {
   return entries.filter((e) => e.amt > 0n);
 }
 
+function roundField(info, name, index) {
+  const value = info?.[name] ?? info?.[index];
+  return value;
+}
+
+function roundPhase(info) {
+  return Number(roundField(info, "phase", 6));
+}
+
+function sortWallets(wallets) {
+  return wallets.map((w) => getAddress(w.toLowerCase())).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+async function waitForRoundLocked(publicClient, distributor, roundId) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const info = await readRoundInfo(publicClient, distributor, roundId);
+    if (roundPhase(info) === PHASE_LOCKED) return info;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+  throw new Error(`round ${roundId} did not reach Locked phase`);
+}
+
 function roundPayout(info) {
-  const raw = info.payoutAmount ?? info[3];
+  const raw = roundField(info, "payoutAmount", 3);
   return raw == null ? 0n : BigInt(raw);
 }
 
@@ -149,8 +172,8 @@ async function waitForRoundFunding(publicClient, distributor, roundId, { poll = 
   return result;
 }
 
-async function payAll(wallet, publicClient, roundId, merkle) {
-  for (let i = 0; i < merkle.leaves.length; i += BATCH) {
+async function payAll(wallet, publicClient, roundId, merkle, startIndex = 0) {
+  for (let i = startIndex; i < merkle.leaves.length; i += BATCH) {
     const slice = merkle.leaves.slice(i, i + BATCH);
     const recipients = slice.map((l) => l.who);
     const amounts = slice.map((l) => l.amt);
@@ -206,6 +229,30 @@ async function routeFees(wallet, publicClient, router, paired, projectToken) {
       }
     }
   }
+}
+
+async function findActiveRound(publicClient, distributor, projectToken) {
+  const count = BigInt(
+    await publicClient.readContract({
+      address: distributor,
+      abi: distributorAbi,
+      functionName: "roundCount",
+    }),
+  );
+  for (let roundId = count - 1n; roundId >= 0n; roundId--) {
+    const info = await readRoundInfo(publicClient, distributor, roundId);
+    if (getAddress(roundField(info, "token", 0)) !== getAddress(projectToken)) continue;
+    const phase = roundPhase(info);
+    const paidCount = Number(roundField(info, "paidCount", 2) ?? 0);
+    const recipientCount = Number(roundField(info, "recipientCount", 1) ?? 0);
+    if (phase === PHASE_OPEN) {
+      return { roundId, phase, info, paidCount, recipientCount };
+    }
+    if (phase === PHASE_LOCKED && paidCount < recipientCount) {
+      return { roundId, phase, info, paidCount, recipientCount };
+    }
+  }
+  return null;
 }
 
 async function findOpenRound(publicClient, distributor, projectToken) {
@@ -316,20 +363,36 @@ export async function run() {
     epochEnd: process.env.EPOCH_END || "2026-08-28",
   });
 
-  const wallets = testWallets() ?? duneWallets;
-  if (wallets.length === 0) {
+  const rawWallets = testWallets() ?? duneWallets;
+  if (rawWallets.length === 0) {
     console.log("no renewers in window", window);
     return;
   }
-  console.log("renewers", wallets.length, window, testWallets() ? "(TEST_WALLETS override)" : "");
+  console.log("renewers", rawWallets.length, window, testWallets() ? "(TEST_WALLETS override)" : "");
 
   if (dryRun()) {
-    console.log("dryRun would openRound, absorb, lock, payBatch for", wallets.length, "wallets");
+    console.log("dryRun would openRound, absorb, lock, payBatch for", rawWallets.length, "wallets");
     return;
   }
 
-  let openedRoundId = await findOpenRound(publicClient, distributor, projectToken);
-  if (openedRoundId === null) {
+  const active = await findActiveRound(publicClient, distributor, projectToken);
+  const resumingLocked = active?.phase === PHASE_LOCKED;
+  const wallets = resumingLocked ? rawWallets.map((w) => getAddress(w.toLowerCase())) : sortWallets(rawWallets);
+
+  let roundId;
+  let payoutAmount;
+  let paidCount = 0;
+
+  if (active) {
+    roundId = active.roundId;
+    payoutAmount = roundPayout(active.info);
+    paidCount = active.paidCount;
+    console.log(
+      resumingLocked ? "resume locked round" : "resume open round",
+      roundId.toString(),
+      paidCount > 0 ? `(paid ${paidCount}/${active.recipientCount})` : "",
+    );
+  } else {
     const openHash = await wallet.writeContract({
       address: distributor,
       abi: distributorAbi,
@@ -338,8 +401,8 @@ export async function run() {
     });
     const openReceipt = await publicClient.waitForTransactionReceipt({ hash: openHash });
     console.log("openRound", openHash);
-    openedRoundId = roundIdFromReceipt(openReceipt);
-    if (openedRoundId === null) {
+    roundId = roundIdFromReceipt(openReceipt);
+    if (roundId === null) {
       const count = BigInt(
         await publicClient.readContract({
           address: distributor,
@@ -348,49 +411,60 @@ export async function run() {
         }),
       );
       if (count === 0n) throw new Error("openRound succeeded but roundCount is still 0");
-      openedRoundId = count - 1n;
+      roundId = count - 1n;
     }
-  } else {
-    console.log("resume open round", openedRoundId.toString());
+    payoutAmount = 0n;
   }
 
-  let { payoutAmount } = await waitForRoundFunding(publicClient, distributor, openedRoundId);
-  if (payoutAmount === 0n) {
-    const absorbHash = await wallet.writeContract({
-      address: distributor,
-      abi: distributorAbi,
-      functionName: "absorbBalance",
-      args: [openedRoundId],
-    });
-    await publicClient.waitForTransactionReceipt({ hash: absorbHash });
-    console.log("absorbBalance", absorbHash);
-    ({ payoutAmount } = await waitForRoundFunding(publicClient, distributor, openedRoundId, {
-      poll: true,
-    }));
-  } else {
-    console.log("round already funded", payoutAmount.toString());
-  }
+  if (!resumingLocked) {
+    ({ payoutAmount } = await waitForRoundFunding(publicClient, distributor, roundId));
+    if (payoutAmount === 0n) {
+      const absorbHash = await wallet.writeContract({
+        address: distributor,
+        abi: distributorAbi,
+        functionName: "absorbBalance",
+        args: [roundId],
+      });
+      await publicClient.waitForTransactionReceipt({ hash: absorbHash });
+      console.log("absorbBalance", absorbHash);
+      ({ payoutAmount } = await waitForRoundFunding(publicClient, distributor, roundId, {
+        poll: true,
+      }));
+    } else {
+      console.log("round already funded", payoutAmount.toString());
+    }
 
-  if (payoutAmount === 0n) {
-    console.log("no token fees to distribute this run");
-    return;
+    if (payoutAmount === 0n) {
+      console.log("no token fees to distribute this run");
+      return;
+    }
   }
 
   const entries = buildEntries(wallets, payoutAmount);
   const merkle = buildMerkle(entries);
   console.log("payout", payoutAmount.toString(), "root", merkle.root);
 
-  const lockHash = await wallet.writeContract({
-    address: distributor,
-    abi: distributorAbi,
-    functionName: "lockRound",
-    args: [openedRoundId, merkle.root, entries.length],
-  });
-  await publicClient.waitForTransactionReceipt({ hash: lockHash });
-  console.log("lockRound", lockHash);
+  if (!resumingLocked) {
+    const lockHash = await wallet.writeContract({
+      address: distributor,
+      abi: distributorAbi,
+      functionName: "lockRound",
+      args: [roundId, merkle.root, entries.length],
+    });
+    await publicClient.waitForTransactionReceipt({ hash: lockHash });
+    console.log("lockRound", lockHash);
+    await waitForRoundLocked(publicClient, distributor, roundId);
+  } else {
+    const lockedRoot = roundField(active.info, "merkleRoot", 5);
+    if (merkle.root !== lockedRoot) {
+      throw new Error(
+        `merkle root mismatch for round ${roundId}: rebuilt ${merkle.root} != locked ${lockedRoot}`,
+      );
+    }
+  }
 
-  await payAll(wallet, publicClient, openedRoundId, merkle);
-  console.log("done round", openedRoundId.toString());
+  await payAll(wallet, publicClient, roundId, merkle, paidCount);
+  console.log("done round", roundId.toString());
 }
 
 console.log("bankrprompt-keeper starting", new Date().toISOString());
