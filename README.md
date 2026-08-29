@@ -10,6 +10,16 @@ Clanker/Bankr fees claimed → BankrFeeRouter
 
 Renewer list comes from [Dune query 5839788](https://dune.com/queries/5839788) (`is_renewal = true`).
 
+## Live on Base (8453)
+
+| Contract | Address |
+|----------|---------|
+| **BankrFeeRouter** | `0x1559585655Be00BA4A2BF02B118D559f8190E95D` |
+| **BankrRenewerDistributor** | `0x2a3D662ec48498C85FdfdE2C61C88EE19f77BA3B` |
+| ClankerFeeLocker | `0xF3622742b1E446D92e45E22923Ef11C2fcD55D68` |
+
+Keeper calls `FeeLocker.claim(router, token)` (anyone can crank), then `route()` / `routeToken()`.
+
 ## Repo layout
 
 | Path | Purpose |
@@ -39,13 +49,15 @@ Save the printed `BANKR_FEE_ROUTER` and `BANKR_RENEWER_DISTRIBUTOR` addresses.
 
 ### Token launch
 
-Set the Bankr/Clanker **fee recipient** to `BANKR_FEE_ROUTER`:
+Set the Bankr/Clanker **fee recipient** to the router at launch:
 
 ```bash
-bankr launch --name "..." --symbol "..." --fee "0xRouter..." --fee-type wallet -y
+bankr launch --name "..." --symbol "..." \
+  --fee "0x1559585655Be00BA4A2BF02B118D559f8190E95D" \
+  --fee-type wallet -y
 ```
 
-Or claim fees into the router, then the keeper calls `route()`.
+Fees accrue in ClankerFeeLocker for the router address. The keeper claims them on-chain each cron run.
 
 ## 2. Railway
 
@@ -69,7 +81,7 @@ Or claim fees into the router, then the keeper calls `route()`.
 | **Week 1** | `august_backfill` | All `is_renewal` wallets with payment in Aug 2026 |
 | **After** | `weekly` | Renewals in the current Mon–Sun UTC week |
 
-Each cron run: `route()` → open round → absorb token balance → equal Merkle split → `payBatch` to all renewers.
+Each cron run: `FeeLocker.claim` → `route()` → open round → absorb → Merkle lock → `payBatch`.
 
 ## Tests
 
