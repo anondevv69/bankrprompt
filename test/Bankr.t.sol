@@ -38,23 +38,31 @@ contract BankrTest is Test {
     BankrRenewerDistributor internal distributor;
     BankrFeeRouter internal router;
     MockERC20 internal weth;
+    MockERC20 internal paired;
     MockERC20 internal token;
     address internal keeper = address(0xBEEF);
     address internal renewer = address(0xCAFE);
 
     function setUp() public {
         weth = new MockERC20();
+        paired = new MockERC20();
         token = new MockERC20();
         distributor = new BankrRenewerDistributor(OPS, keeper);
-        router = new BankrFeeRouter(address(weth), OPS, address(token), address(distributor));
+        router = new BankrFeeRouter(address(weth), address(paired), OPS, address(token), address(distributor));
     }
 
-    function test_router_splits_weth_and_token() public {
-        weth.mint(address(router), 3 ether);
+    function test_router_splits_paired_and_project_token() public {
+        paired.mint(address(router), 5 ether);
         token.mint(address(router), 100 ether);
         router.route();
-        assertEq(weth.balanceOf(OPS), 3 ether);
+        assertEq(paired.balanceOf(OPS), 5 ether);
         assertEq(token.balanceOf(address(distributor)), 100 ether);
+    }
+
+    function test_routeToken_sends_paired_to_ops() public {
+        paired.mint(address(router), 2 ether);
+        router.routeToken(address(paired));
+        assertEq(paired.balanceOf(OPS), 2 ether);
     }
 
     function test_absorb_and_payBatch() public {

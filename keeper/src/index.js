@@ -12,6 +12,7 @@ import { fetchRenewers } from "./dune.js";
 
 const BATCH = Number(process.env.PAY_BATCH_SIZE || "40");
 const WETH = "0x4200000000000000000000000000000000000006";
+const DEFAULT_BNKR = "0x22aF33FE49fD1Fa80c7149773dDe5890D3c76F3b";
 const CLANKER_FEE_LOCKER =
   process.env.CLANKER_FEE_LOCKER || "0xF3622742b1E446D92e45E22923Ef11C2fcD55D68";
 
@@ -20,7 +21,7 @@ const feeLockerAbi = parseAbi([
   "function availableFees(address feeOwner, address token) view returns (uint256)",
 ]);
 const routerAbi = parseAbi([
-  "function route() returns (uint256 wethAmount, uint256 tokenAmount)",
+  "function route() returns (uint256 opsAmount, uint256 tokenAmount)",
   "function routeToken(address token) returns (uint256 amount)",
 ]);
 const distributorAbi = parseAbi([
@@ -36,6 +37,11 @@ function env(name, fallback = "") {
   const v = String(process.env[name] || fallback).trim();
   if (!v) throw new Error(`missing ${name}`);
   return v;
+}
+
+function envMaybe(name, fallback = "") {
+  const v = String(process.env[name] || fallback).trim();
+  return v ? getAddress(v.toLowerCase()) : "";
 }
 
 function envAddr(name) {
@@ -74,36 +80,44 @@ async function payAll(wallet, publicClient, roundId, merkle) {
   }
 }
 
+async function claimIfAvailable(publicClient, wallet, feeLocker, router, claimToken) {
+  const available = await publicClient.readContract({
+    address: feeLocker,
+    abi: feeLockerAbi,
+    functionName: "availableFees",
+    args: [router, claimToken],
+  });
+  if (available === 0n) return;
+  const claimHash = await wallet.writeContract({
+    address: feeLocker,
+    abi: feeLockerAbi,
+    functionName: "claim",
+    args: [router, claimToken],
+  });
+  await publicClient.waitForTransactionReceipt({ hash: claimHash });
+  console.log("feeLocker.claim", claimToken, claimHash, available.toString());
+}
+
 export async function run() {
   const rpc = process.env.BASE_RPC_URL || "https://mainnet.base.org";
   const account = privateKeyToAccount(key());
   const publicClient = createPublicClient({ chain: base, transport: http(rpc) });
   const wallet = createWalletClient({ account, chain: base, transport: http(rpc) });
 
-  const token = envAddr("PROJECT_TOKEN");
+  const paired = envMaybe("PAIRED_TOKEN", DEFAULT_BNKR);
+  const projectToken = envMaybe("PROJECT_TOKEN");
   const router = envAddr("BANKR_FEE_ROUTER");
   const distributor = envAddr("BANKR_RENEWER_DISTRIBUTOR");
 
   console.log("keeper", account.address);
   console.log("epoch", process.env.EPOCH_MODE || "august_backfill");
+  console.log("paired", paired || "(none)");
+  console.log("project", projectToken || "(none — claim/route only)");
 
   const feeLocker = getAddress(CLANKER_FEE_LOCKER.toLowerCase());
-  for (const claimToken of [WETH, token]) {
-    const available = await publicClient.readContract({
-      address: feeLocker,
-      abi: feeLockerAbi,
-      functionName: "availableFees",
-      args: [router, claimToken],
-    });
-    if (available === 0n) continue;
-    const claimHash = await wallet.writeContract({
-      address: feeLocker,
-      abi: feeLockerAbi,
-      functionName: "claim",
-      args: [router, claimToken],
-    });
-    await publicClient.waitForTransactionReceipt({ hash: claimHash });
-    console.log("feeLocker.claim", claimToken, claimHash, available.toString());
+  const claimTokens = [WETH, paired, projectToken].filter(Boolean);
+  for (const claimToken of claimTokens) {
+    await claimIfAvailable(publicClient, wallet, feeLocker, router, claimToken);
   }
 
   try {
@@ -119,18 +133,9 @@ export async function run() {
     if (!msg.includes("NothingToRoute")) console.log("route skipped:", msg);
   }
 
-  try {
-    const hash = await wallet.writeContract({
-      address: router,
-      abi: routerAbi,
-      functionName: "routeToken",
-      args: [token],
-    });
-    await publicClient.waitForTransactionReceipt({ hash });
-    console.log("routeToken", token, hash);
-  } catch (e) {
-    const msg = String(e?.shortMessage || e?.message || e);
-    if (!msg.includes("NothingToRoute")) console.log("routeToken skipped:", msg);
+  if (!projectToken) {
+    console.log("no PROJECT_TOKEN — skipping renewer distribution");
+    return;
   }
 
   const { wallets, window } = await fetchRenewers({
@@ -150,7 +155,7 @@ export async function run() {
     address: distributor,
     abi: distributorAbi,
     functionName: "openRound",
-    args: [token],
+    args: [projectToken],
   });
   await publicClient.waitForTransactionReceipt({ hash: openHash });
   console.log("openRound", openHash);

@@ -1,95 +1,76 @@
 # Bankr Prompt — Club renewer fee flywheel (Base)
 
-Distributes **project-token** trading fees to **Bankr Club members who renewed** in the eligibility window. **All WETH** goes to the ops wallet (`0x374d…`).
+Distributes **project-token** trading fees to **Bankr Club members who renewed** in the eligibility window. **BNKR** (or WETH) paired fees go to the ops wallet (`0x374d…`).
 
 ```
-Clanker/Bankr fees claimed → BankrFeeRouter
-    ├─ WETH  → ops wallet (100%)
-    └─ token → BankrRenewerDistributor → equal push to renewers
+ClankerFeeLocker.claim(router, …)
+        ↓
+BankrFeeRouter
+    ├─ BNKR / WETH  → ops wallet (100%)
+    └─ project token → BankrRenewerDistributor → equal push to renewers
 ```
 
-Renewer list comes from [Dune query 5839788](https://dune.com/queries/5839788) (`is_renewal = true`).
+Renewer list: [Dune query 5839788](https://dune.com/queries/5839788) (`is_renewal = true`).
 
-## Live on Base (8453)
+## Live on Base (8453) — v1 deploy
 
 | Contract | Address |
 |----------|---------|
-| **BankrFeeRouter** | `0x1559585655Be00BA4A2BF02B118D559f8190E95D` |
+| **BankrFeeRouter v1** | `0x1559585655Be00BA4A2BF02B118D559f8190E95D` |
 | **BankrRenewerDistributor** | `0x2a3D662ec48498C85FdfdE2C61C88EE19f77BA3B` |
 | ClankerFeeLocker | `0xF3622742b1E446D92e45E22923Ef11C2fcD55D68` |
+| BNKR (default pair) | `0x22aF33FE49fD1Fa80c7149773dDe5890D3c76F3b` |
 
-Keeper calls `FeeLocker.claim(router, token)` (anyone can crank), then `route()` / `routeToken()`.
+**Router v1** routes WETH → ops but sends **all other tokens (including BNKR) to the distributor**. For BNKR-paired launches, **redeploy router v2** from this repo (includes `PAIRED_TOKEN`) and use the new address as fee recipient.
 
-## Repo layout
+Distributor v1 is fine — keep `0x2a3D…`.
 
-| Path | Purpose |
-|------|---------|
-| `src/` | Solidity contracts (Foundry) |
-| `script/Deploy.s.sol` | Base deploy |
-| `keeper/` | Railway cron worker — **set Root Directory to `keeper`** |
+## Railway (quick start)
 
-## 1. Deploy contracts (Base)
+1. Push this repo to GitHub (see below if empty).
+2. [New Railway project](https://railway.app) → Deploy from GitHub → `anondevv69/bankrprompt`
+3. **Root Directory:** `keeper`
+4. Add variables from `keeper/.env.example`
+5. Deploy — cron runs hourly (`keeper/railway.toml`)
 
-```bash
-export BASE_RPC_URL=https://mainnet.base.org
-export DEPLOYER_KEY=0x...
-export PAYOUT_OWNER=0x374D91a5674Fa7Cf86E725093b5848b97e1e13b4
-export PAYOUT_KEEPER=0xYourKeeperHotWallet
-export PROJECT_TOKEN=0xYourTokenOnBase   # required for router token routing
-# optional override:
-# export WETH_RECIPIENT=0x374D91a5674Fa7Cf86E725093b5848b97e1e13b4
+**Test without a launched token:** set `KEEPER_KEY`, router/distributor addresses, `DUNE_API_KEY`. Leave `PROJECT_TOKEN` empty — keeper will claim/route only and skip renewer payouts.
 
-forge script script/Deploy.s.sol:Deploy \
-  --rpc-url "$BASE_RPC_URL" \
-  --broadcast \
-  --private-key "$DEPLOYER_KEY"
-```
-
-Save the printed `BANKR_FEE_ROUTER` and `BANKR_RENEWER_DISTRIBUTOR` addresses.
-
-### Token launch
-
-Set the Bankr/Clanker **fee recipient** to the router at launch:
+## Token launch
 
 ```bash
 bankr launch --name "..." --symbol "..." \
-  --fee "0x1559585655Be00BA4A2BF02B118D559f8190E95D" \
+  --fee "0xYOUR_ROUTER_ADDRESS" \
   --fee-type wallet -y
 ```
 
-Fees accrue in ClankerFeeLocker for the router address. The keeper claims them on-chain each cron run.
+Use **router v2** address after redeploy for BNKR-paired tokens.
 
-## 2. Railway
+## Redeploy router v2 (BNKR pair)
 
-1. New service from this repo: https://github.com/anondevv69/bankrprompt
-2. **Root Directory:** `keeper`
-3. **Cron:** enabled (hourly via `keeper/railway.toml`)
-4. Variables from `keeper/.env.example`
+```bash
+export BASE_RPC_URL=https://mainnet.base.org
+export DEPLOYER_KEY=...
+export PAYOUT_OWNER=0x374D91a5674Fa7Cf86E725093b5848b97e1e13b4
+export PAYOUT_KEEPER=0x6eb052b25399809F858Dc1B69b8Ff9225aE44b54
+export PAIRED_TOKEN=0x22aF33FE49fD1Fa80c7149773dDe5890D3c76F3b
+export PROJECT_TOKEN=0xYourToken   # optional at deploy
 
-| Variable | Notes |
-|----------|--------|
-| `KEEPER_KEY` | Same as `PAYOUT_KEEPER` — pays gas, runs rounds |
-| `BANKR_FEE_ROUTER` | Deployed router |
-| `BANKR_RENEWER_DISTRIBUTOR` | Deployed distributor |
-| `PROJECT_TOKEN` | Your Base token CA |
-| `DUNE_API_KEY` | Dune API key (rotate if exposed) |
+forge script script/Deploy.s.sol:Deploy \
+  --rpc-url "$BASE_RPC_URL" --broadcast --private-key "$DEPLOYER_KEY"
+```
+
+Re-use existing distributor: deploy script creates a new one — for v2 router only, deploy router manually or set distributor address in script. *Note: current Deploy.s.sol deploys both; for router-only v2, point constructor at `0x2a3D…` distributor.*
 
 ## Epochs
 
 | Phase | `EPOCH_MODE` | Who gets token fees |
 |-------|----------------|---------------------|
-| **Week 1** | `august_backfill` | All `is_renewal` wallets with payment in Aug 2026 |
-| **After** | `weekly` | Renewals in the current Mon–Sun UTC week |
-
-Each cron run: `FeeLocker.claim` → `route()` → open round → absorb → Merkle lock → `payBatch`.
+| Week 1 | `august_backfill` | All Aug 2026 `is_renewal` wallets |
+| After | `weekly` | That week's renewals |
 
 ## Tests
 
 ```bash
 forge test
-cd keeper && npm install
+cd keeper && npm install && npm start
 ```
-
-## Ops wallet
-
-WETH recipient is fixed at deploy to `0x374D91a5674Fa7Cf86E725093b5848b97e1e13b4` unless `WETH_RECIPIENT` is set.
