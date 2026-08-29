@@ -1,6 +1,7 @@
 import {
   createPublicClient,
   createWalletClient,
+  decodeEventLog,
   getAddress,
   http,
   parseAbi,
@@ -32,7 +33,10 @@ const distributorAbi = parseAbi([
   "function lockRound(uint256 roundId, bytes32 merkleRoot, uint32 recipientCount)",
   "function payBatch(uint256 roundId, address[] recipients, uint256[] amounts, bytes32[][] proofs)",
   "function roundInfo(uint256 roundId) view returns (address token, uint32 recipientCount, uint32 paidCount, uint256 payoutAmount, uint256 paidOut, bytes32 merkleRoot, uint8 phase)",
+  "event RoundOpened(uint256 indexed roundId, address indexed token)",
 ]);
+
+const PHASE_OPEN = 0;
 
 function env(name, fallback = "") {
   const v = String(process.env[name] || fallback).trim();
@@ -91,6 +95,84 @@ async function payAll(wallet, publicClient, roundId, merkle) {
   }
 }
 
+async function routeFees(wallet, publicClient, router, paired, projectToken) {
+  if (dryRun()) {
+    console.log("dryRun route()");
+    for (const token of [...new Set([paired, projectToken].filter(Boolean))]) {
+      console.log("dryRun routeToken", token);
+    }
+    return;
+  }
+
+  try {
+    const hash = await wallet.writeContract({
+      address: router,
+      abi: routerAbi,
+      functionName: "route",
+    });
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    console.log("route", hash, receipt.status);
+  } catch (e) {
+    const msg = String(e?.shortMessage || e?.message || e);
+    if (!msg.includes("NothingToRoute")) console.log("route skipped:", msg);
+  }
+
+  const routeTokens = [...new Set([paired, projectToken].filter(Boolean))];
+  for (const token of routeTokens) {
+    try {
+      const hash = await wallet.writeContract({
+        address: router,
+        abi: routerAbi,
+        functionName: "routeToken",
+        args: [token],
+      });
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      console.log("routeToken", token, hash, receipt.status);
+    } catch (e) {
+      const msg = String(e?.shortMessage || e?.message || e);
+      if (!msg.includes("NothingToRoute")) console.log("routeToken skipped", token, msg);
+    }
+  }
+}
+
+async function findOpenRound(publicClient, distributor, projectToken) {
+  const count = BigInt(
+    await publicClient.readContract({
+      address: distributor,
+      abi: distributorAbi,
+      functionName: "roundCount",
+    }),
+  );
+  for (let roundId = count - 1n; roundId >= 0n; roundId--) {
+    const info = await publicClient.readContract({
+      address: distributor,
+      abi: distributorAbi,
+      functionName: "roundInfo",
+      args: [roundId],
+    });
+    if (info[6] === PHASE_OPEN && getAddress(info[0]) === getAddress(projectToken)) {
+      return roundId;
+    }
+  }
+  return null;
+}
+
+function roundIdFromReceipt(receipt) {
+  for (const log of receipt.logs) {
+    try {
+      const decoded = decodeEventLog({
+        abi: distributorAbi,
+        data: log.data,
+        topics: log.topics,
+      });
+      if (decoded.eventName === "RoundOpened") return decoded.args.roundId;
+    } catch {
+      // not our event
+    }
+  }
+  return null;
+}
+
 async function claimIfAvailable(publicClient, wallet, feeLocker, router, claimToken) {
   const available = await publicClient.readContract({
     address: feeLocker,
@@ -147,44 +229,7 @@ export async function run() {
     console.log("dryRun doppler claim for", projectToken);
   }
 
-  try {
-    if (dryRun()) {
-      console.log("dryRun route()");
-    } else {
-      const hash = await wallet.writeContract({
-        address: router,
-        abi: routerAbi,
-        functionName: "route",
-      });
-      const receipt = await publicClient.waitForTransactionReceipt({ hash });
-      console.log("route", hash, receipt.status);
-    }
-  } catch (e) {
-    const msg = String(e?.shortMessage || e?.message || e);
-    if (!msg.includes("NothingToRoute")) console.log("route skipped:", msg);
-  }
-
-  // v1 router (PROJECT_TOKEN=0 at deploy): route() only moves WETH — flush paired + project via routeToken
-  const routeTokens = [...new Set([paired, projectToken].filter(Boolean))];
-  for (const token of routeTokens) {
-    try {
-      if (dryRun()) {
-        console.log("dryRun routeToken", token);
-        continue;
-      }
-      const hash = await wallet.writeContract({
-        address: router,
-        abi: routerAbi,
-        functionName: "routeToken",
-        args: [token],
-      });
-      const receipt = await publicClient.waitForTransactionReceipt({ hash });
-      console.log("routeToken", token, hash, receipt.status);
-    } catch (e) {
-      const msg = String(e?.shortMessage || e?.message || e);
-      if (!msg.includes("NothingToRoute")) console.log("routeToken skipped", token, msg);
-    }
-  }
+  await routeFees(wallet, publicClient, router, paired, projectToken);
 
   if (!projectToken) {
     console.log("no PROJECT_TOKEN — skipping renewer distribution");
@@ -210,21 +255,31 @@ export async function run() {
     return;
   }
 
-  const openHash = await wallet.writeContract({
-    address: distributor,
-    abi: distributorAbi,
-    functionName: "openRound",
-    args: [projectToken],
-  });
-  await publicClient.waitForTransactionReceipt({ hash: openHash });
-  console.log("openRound", openHash);
-
-  let openedRoundId = await publicClient.readContract({
-    address: distributor,
-    abi: distributorAbi,
-    functionName: "roundCount",
-  });
-  openedRoundId -= 1n;
+  let openedRoundId = await findOpenRound(publicClient, distributor, projectToken);
+  if (openedRoundId === null) {
+    const openHash = await wallet.writeContract({
+      address: distributor,
+      abi: distributorAbi,
+      functionName: "openRound",
+      args: [projectToken],
+    });
+    const openReceipt = await publicClient.waitForTransactionReceipt({ hash: openHash });
+    console.log("openRound", openHash);
+    openedRoundId = roundIdFromReceipt(openReceipt);
+    if (openedRoundId === null) {
+      const count = BigInt(
+        await publicClient.readContract({
+          address: distributor,
+          abi: distributorAbi,
+          functionName: "roundCount",
+        }),
+      );
+      if (count === 0n) throw new Error("openRound succeeded but roundCount is still 0");
+      openedRoundId = count - 1n;
+    }
+  } else {
+    console.log("resume open round", openedRoundId.toString());
+  }
 
   const absorbHash = await wallet.writeContract({
     address: distributor,
