@@ -152,6 +152,28 @@ export async function run() {
     if (!msg.includes("NothingToRoute")) console.log("route skipped:", msg);
   }
 
+  // v1 router (PROJECT_TOKEN=0 at deploy): route() only moves WETH — flush paired + project via routeToken
+  const routeTokens = [...new Set([paired, projectToken].filter(Boolean))];
+  for (const token of routeTokens) {
+    try {
+      if (dryRun()) {
+        console.log("dryRun routeToken", token);
+        continue;
+      }
+      const hash = await wallet.writeContract({
+        address: router,
+        abi: routerAbi,
+        functionName: "routeToken",
+        args: [token],
+      });
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      console.log("routeToken", token, hash, receipt.status);
+    } catch (e) {
+      const msg = String(e?.shortMessage || e?.message || e);
+      if (!msg.includes("NothingToRoute")) console.log("routeToken skipped", token, msg);
+    }
+  }
+
   if (!projectToken) {
     console.log("no PROJECT_TOKEN — skipping renewer distribution");
     return;
